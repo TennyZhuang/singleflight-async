@@ -1,6 +1,4 @@
-use std::{
-    borrow::Cow, cell::UnsafeCell, collections::HashMap, future::Future, ops::Deref, sync::Arc,
-};
+use std::{cell::UnsafeCell, collections::HashMap, future::Future, hash::Hash, sync::Arc};
 
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use tokio::sync::{futures::Notified, Notify};
@@ -8,40 +6,14 @@ use tokio::sync::{futures::Notified, Notify};
 /// SingleFlight represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Debug)]
-pub struct SingleFlight<T> {
-    mapping: Arc<RwLock<HashMap<Cow<'static, str>, BroadcastOnce<T>>>>,
+pub struct SingleFlight<K, T> {
+    mapping: Arc<RwLock<HashMap<K, BroadcastOnce<T>>>>,
 }
 
-impl<T> Default for SingleFlight<T> {
+impl<K, T> Default for SingleFlight<K, T> {
     fn default() -> Self {
         Self {
             mapping: Default::default(),
-        }
-    }
-}
-
-// Key is designed to avoid String clone.
-enum Key<'a> {
-    Static(Cow<'static, str>),
-    MaybeBorrowed(Cow<'a, str>),
-}
-
-impl<'a> Deref for Key<'a> {
-    type Target = Cow<'a, str>;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Key::Static(cow) => cow,
-            Key::MaybeBorrowed(cow) => cow,
-        }
-    }
-}
-
-impl<'a> From<Key<'a>> for Cow<'static, str> {
-    fn from(k: Key<'a>) -> Self {
-        match k {
-            Key::Static(cow) => cow,
-            Key::MaybeBorrowed(cow) => Cow::Owned(cow.into_owned()),
         }
     }
 }
@@ -127,46 +99,23 @@ impl<T> BroadcastOnceWaiter<T> {
     }
 }
 
-impl<T> SingleFlight<T> {
+impl<K, T> SingleFlight<K, T> {
     /// Create a new BroadcastOnce to do work with.
     #[inline]
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl<K, T> SingleFlight<K, T>
+where
+    K: Hash + Eq + Clone,
+{
     /// Execute and return the value for a given function, making sure that only one
     /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
     /// wait until the original call completes and return the same value.
-    ///
-    /// The key is a Owned key. The performance will be slightly better than `work`.
-    pub fn work_with_owned_key<F, Fut>(
-        &self,
-        key: Cow<'static, str>,
-        func: F,
-    ) -> impl Future<Output = T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-        T: Clone,
-    {
-        self.work_inner(Key::Static(key), func)
-    }
-
-    /// Execute and return the value for a given function, making sure that only one
-    /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
-    /// wait until the original call completes and return the same value.
-    pub fn work<F, Fut>(&self, key: &str, func: F) -> impl Future<Output = T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-        T: Clone,
-    {
-        self.work_inner(Key::MaybeBorrowed(key.into()), func)
-    }
-
     #[allow(clippy::await_holding_lock)]
-    #[inline]
-    fn work_inner<'a, 'b: 'a, F, Fut>(&'a self, key: Key<'b>, func: F) -> impl Future<Output = T>
+    pub fn work<F, Fut>(&self, key: K, func: F) -> impl Future<Output = T>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
@@ -179,7 +128,7 @@ impl<T> SingleFlight<T> {
 
         // here the lock does not across await
         let m = self.mapping.upgradable_read();
-        let val = m.get(key.deref());
+        let val = m.get(&key);
         let either = match val {
             Some(call) => {
                 let waiter = call.waiter();
@@ -187,7 +136,6 @@ impl<T> SingleFlight<T> {
                 Either::Left(waiter)
             }
             None => {
-                let key: Cow<'static, str> = key.into();
                 let call = BroadcastOnce::new();
                 {
                     let mut m = RwLockUpgradableReadGuard::upgrade(m);
@@ -286,7 +234,7 @@ mod tests {
     async fn call_with_static_str_key() {
         let group = SingleFlight::new();
         let result = group
-            .work_with_owned_key("key".into(), || async {
+            .work("key", || async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 "Result".to_string()
             })
@@ -298,7 +246,7 @@ mod tests {
     async fn call_with_static_string_key() {
         let group = SingleFlight::new();
         let result = group
-            .work_with_owned_key("key".to_string().into(), || async {
+            .work("key".to_string(), || async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 "Result".to_string()
             })
@@ -309,11 +257,11 @@ mod tests {
     #[tokio::test]
     async fn late_wait() {
         let group = SingleFlight::new();
-        let fut_early = group.work_with_owned_key("key".into(), || async {
+        let fut_early = group.work("key", || async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             "Result".to_string()
         });
-        let fut_late = group.work_with_owned_key("key".into(), || async { panic!("unexpected") });
+        let fut_late = group.work("key", || async { panic!("unexpected") });
         assert_eq!(fut_early.await, "Result");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fut_late.await, "Result");
